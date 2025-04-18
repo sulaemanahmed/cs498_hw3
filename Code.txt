@@ -1,0 +1,195 @@
+nano load_data.py
+
+/////////code-------------------------------------------------------------------------
+import pandas as pd
+from google.cloud import bigtable
+from google.cloud.bigtable import column_family
+import sys
+
+# Configuration
+project_id = "proven-record-451907-e3"
+instance_id = "ev-bigtable"
+table_id = "ev-population"
+column_family_id = "ev_info"
+
+# Initialize Bigtable
+client = bigtable.Client(project=project_id, admin=True)
+instance = client.instance(instance_id)
+table = instance.table(table_id)
+
+# Create column family if missing
+if not table.exists():
+    table.create(column_families={column_family_id: column_family.MaxVersionsGCRule(2)})
+
+# Process CSV with pandas in chunks
+def safe_encode(value):
+    """Handle encoding for both strings and numbers"""
+    if pd.isna(value):
+        return ""
+    return str(value).encode('utf-8')
+
+print("Starting data load...")
+chunk_size = 1000
+row_count = 0
+
+# Process CSV in chunks to save memory
+for chunk in pd.read_csv(
+    'Electric_Vehicle_Population_Data.csv',
+    chunksize=chunk_size,
+    dtype={'DOL Vehicle ID': str},  # Ensure ID is treated as string
+    encoding='utf-8',
+    on_bad_lines='warn'  # Skip problematic rows if any
+):
+    batch = table.mutations_batcher()
+    
+    for _, row in chunk.iterrows():
+        try:
+            row_key = str(row['DOL Vehicle ID']).encode('utf-8')
+            direct_row = table.direct_row(row_key)
+            
+            # Set cells with proper encoding
+            direct_row.set_cell(
+                column_family_id,
+                b"make",
+                safe_encode(row['Make'])
+            )
+            direct_row.set_cell(
+                column_family_id,
+                b"model", 
+                safe_encode(row['Model'])
+            )
+            direct_row.set_cell(
+                column_family_id,
+                b"model_year",
+                safe_encode(row['Model Year'])
+            )
+            direct_row.set_cell(
+                column_family_id,
+                b"electric_range",
+                safe_encode(row['Electric Range'])
+            )
+            direct_row.set_cell(
+                column_family_id,
+                b"city",
+                safe_encode(row['City'])
+            )
+            direct_row.set_cell(
+                column_family_id,
+                b"county",
+                safe_encode(row['County'])
+            )
+            
+            batch.add(direct_row)
+            row_count += 1
+            
+        except Exception as e:
+            print(f"Error processing row {row_count}: {str(e)}")
+            continue
+    
+    # Commit the batch
+    batch.flush()
+    print(f"Processed {row_count} rows...")
+
+print(f"Successfully loaded {row_count} rows into Bigtable")
+------------------------------------------------------------------------
+
+python3 load_data.py
+
+nano app.py
+
+from flask import Flask
+from google.cloud import bigtable
+from google.cloud.bigtable import row_filters
+
+app = Flask(__name__)
+
+# Initialize Bigtable client
+client = bigtable.Client(
+    project="proven-record-451907-e3",
+    admin=True
+)
+instance = client.instance("ev-bigtable")
+table = instance.table("ev-population")
+column_family_id = "ev_info"
+
+@app.route('/rows')
+def count_rows():
+    try:
+        rows = table.read_rows()
+        rows.consume_all()
+        return str(len(rows.rows))
+    except Exception as e:
+        return f"Error: {str(e)}", 500
+
+@app.route('/Best-BMW')
+def best_bmw():
+    try:
+        row_filter = row_filters.RowFilterChain([
+            row_filters.FamilyNameRegexFilter(column_family_id),
+            row_filters.ColumnQualifierRegexFilter(b"make"),
+            row_filters.ValueRegexFilter(b"BMW"),
+            row_filters.ColumnQualifierRegexFilter(b"electric_range"),
+            row_filters.ValueRangeFilter(b"100", b"9999")
+        ])
+        rows = table.read_rows(filter_=row_filter)
+        rows.consume_all()
+        return str(len(rows.rows))
+    except Exception as e:
+        return f"Error: {str(e)}", 500
+
+@app.route('/tesla-owners')
+def tesla_seattle():
+    try:
+        row_filter = row_filters.RowFilterChain([
+            row_filters.FamilyNameRegexFilter(column_family_id),
+            row_filters.ColumnQualifierRegexFilter(b"make"),
+            row_filters.ValueRegexFilter(b"TESLA"),
+            row_filters.ColumnQualifierRegexFilter(b"city"),
+            row_filters.ValueRegexFilter(b"Seattle")
+        ])
+        rows = table.read_rows(filter_=row_filter)
+        rows.consume_all()
+        return str(len(rows.rows))
+    except Exception as e:
+        return f"Error: {str(e)}", 500
+
+@app.route('/update')
+def update_range():
+    try:
+        row = table.direct_row("257246118".encode('utf-8'))
+        row.set_cell(
+            column_family_id,
+            b"electric_range",  # Use bytes directly
+            b"200"  # Use bytes for values
+        )
+        row.commit()
+        return "Success"
+    except Exception as e:
+        return f"Error: {str(e)}", 500
+
+@app.route('/delete')
+def delete_old_models():
+    try:
+        # Count before deletion
+        rows = table.read_rows()
+        rows.consume_all()
+        initial_count = len(rows.rows)
+        
+        # Delete old models
+        row_filter = row_filters.RowFilterChain([
+            row_filters.FamilyNameRegexFilter(column_family_id),
+            row_filters.ColumnQualifierRegexFilter(b"model_year"),
+            row_filters.ValueRangeFilter(b"0", b"2014")
+        ])
+        rows_to_delete = table.read_rows(filter_=row_filter)
+        rows_to_delete.consume_all()
+        
+        for row_key in rows_to_delete.rows.keys():
+            table.delete_row(row_key)
+        
+        return str(initial_count - len(rows_to_delete.rows))
+    except Exception as e:
+        return f"Error: {str(e)}", 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, threaded=True)
