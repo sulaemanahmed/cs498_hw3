@@ -124,44 +124,48 @@ def count_rows():
 @app.route('/Best-BMW')
 def best_bmw():
     try:
-        row_filter = row_filters.RowFilterChain([
-            row_filters.FamilyNameRegexFilter(column_family_id),
-            row_filters.ColumnQualifierRegexFilter(b"make"),
-            row_filters.ValueRegexFilter(b"BMW"),
-            row_filters.ColumnQualifierRegexFilter(b"electric_range"),
-            row_filters.ValueRangeFilter(b"100", b"9999")
-        ])
-        rows = table.read_rows(filter_=row_filter)
-        rows.consume_all()
-        return str(len(rows.rows))
+        count = 0
+        rows = table.read_rows()
+        
+        for row in rows:
+            # Get cell values
+            make_cells = row.cells[column_family_id].get(b"make", [])
+            range_cells = row.cells[column_family_id].get(b"electric_range", [])
+            
+            # Check if BMW and range > 100 (exact case match)
+            if (make_cells and make_cells[0].value.decode('utf-8') == "BMW" and
+                range_cells and int(range_cells[0].value.decode('utf-8')) > 100):
+                count += 1
+                
+        return str(count)
     except Exception as e:
         return f"Error: {str(e)}", 500
 
 @app.route('/tesla-owners')
 def tesla_seattle():
     try:
-        row_filter = row_filters.RowFilterChain([
-            row_filters.FamilyNameRegexFilter(column_family_id),
-            row_filters.ColumnQualifierRegexFilter(b"make"),
-            row_filters.ValueRegexFilter(b"TESLA"),
-            row_filters.ColumnQualifierRegexFilter(b"city"),
-            row_filters.ValueRegexFilter(b"Seattle")
-        ])
-        rows = table.read_rows(filter_=row_filter)
-        rows.consume_all()
-        return str(len(rows.rows))
+        count = 0
+        rows = table.read_rows()
+        
+        for row in rows:
+            # Get cell values
+            make_cells = row.cells[column_family_id].get(b"make", [])
+            city_cells = row.cells[column_family_id].get(b"city", [])
+            
+            # Check if Tesla and Seattle (exact case match)
+            if (make_cells and make_cells[0].value.decode('utf-8') == "TESLA" and
+                city_cells and city_cells[0].value.decode('utf-8') == "Seattle"):
+                count += 1
+                
+        return str(count)
     except Exception as e:
         return f"Error: {str(e)}", 500
 
 @app.route('/update')
 def update_range():
     try:
-        row = table.direct_row("257246118".encode('utf-8'))
-        row.set_cell(
-            column_family_id,
-            b"electric_range",  # Use bytes directly
-            b"200"  # Use bytes for values
-        )
+        row = table.direct_row(b"257246118")  # Use bytes directly
+        row.set_cell(column_family_id, b"electric_range", b"200")
         row.commit()
         return "Success"
     except Exception as e:
@@ -175,19 +179,24 @@ def delete_old_models():
         rows.consume_all()
         initial_count = len(rows.rows)
         
-        # Delete old models
-        row_filter = row_filters.RowFilterChain([
-            row_filters.FamilyNameRegexFilter(column_family_id),
-            row_filters.ColumnQualifierRegexFilter(b"model_year"),
-            row_filters.ValueRangeFilter(b"0", b"2014")
-        ])
-        rows_to_delete = table.read_rows(filter_=row_filter)
-        rows_to_delete.consume_all()
+        # Get rows to delete
+        rows_to_delete = []
+        for row in table.read_rows():
+            year_cells = row.cells[column_family_id].get(b"model_year", [])
+            if year_cells and int(year_cells[0].value.decode('utf-8')) <= 2014:
+                rows_to_delete.append(row.row_key)
         
-        for row_key in rows_to_delete.rows.keys():
-            table.delete_row(row_key)
+        # Delete in batch
+        mutations = []
+        for row_key in rows_to_delete:
+            row = table.row(row_key)
+            row.delete()
+            mutations.append(row)
         
-        return str(initial_count - len(rows_to_delete.rows))
+        if mutations:
+            table.mutate_rows(mutations)
+        
+        return str(initial_count - len(rows_to_delete))
     except Exception as e:
         return f"Error: {str(e)}", 500
 
